@@ -1,15 +1,15 @@
 {
-    "name": "Vehicle Check-In",
+    "name": "vehicleCheckIn",
     "supportEmail": "support@geotab.com",
-    "version": "1.0.0",
+    "version": "2.0.1",
     "items": [
         {
-            "url": "https://bjornvandenwijngaert-tech.github.io/drive-addin-inspection/checklist-completion.html",
+            "url": "https://bjornvandenwijngaert-tech.github.io/JCTransportDrive-addin-inspection/index_launchpage.html",
             "path": "DriveAppLink/",
             "menuName": {
                 "en": "Vehicle Check-In"
             },
-            "icon": "https://bjornvandenwijngaert-tech.github.io/drive-addin-inspection/icon.svg"
+            "icon": "https://bjornvandenwijngaert-tech.github.io/JCTransportDrive-addin-inspection/icon.svg"
         }
     ]
 }
