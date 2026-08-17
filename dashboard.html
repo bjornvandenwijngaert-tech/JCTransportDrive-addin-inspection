@@ -255,7 +255,15 @@
           <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"/>
           <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z"/>
         </svg>
-        <p class="text-sm">Loading submissions…</p>
+        <p id="loadingStateText" class="text-sm">Loading submissions…</p>
+      </div>
+
+      <!-- Shown only if MyGeotab never hands over an API object. The page used to
+           reload itself here, which broke the bridge more often than it fixed it. -->
+      <div id="bridgeWaitState" class="hidden bg-white rounded-2xl py-16 text-center mb-5" style="box-shadow:0 1px 3px rgba(0,0,0,0.07),0 4px 14px rgba(0,0,0,0.05);">
+        <p class="text-sm text-slate-500">Waiting for MyGeotab…</p>
+        <p class="text-xs text-slate-400 mt-1">The page has not been handed a session yet.</p>
+        <button onclick="window.location.reload()" class="mt-4 text-xs font-semibold text-white bg-[#0047BB] rounded-lg px-4 py-2">Reload</button>
       </div>
 
       <!-- Table -->
@@ -569,61 +577,178 @@
 </div>
 
 <script>
+// MyGeotab does not put add-in pages in an iframe. It fetches the HTML and injects
+// it into its own document, so every add-in page in the solution runs in ONE shared
+// global scope. Two pages declaring the same top-level `const` is a SyntaxError, and
+// a SyntaxError kills the whole block before its first statement — the second page
+// loaded would never register its add-in, never be handed an api, and sit there
+// empty until the browser was reloaded. Everything below is therefore closed over,
+// and the handful of names the inline markup calls are published deliberately at the
+// bottom of this file. Nothing else may leak.
+(function() {
+
 const ADDIN_ID = 'a1Z2QF2s8nkajnj2rcMUsPQ';
 let _api = null;
 let RESPONSES = [];
 let filtered = [];
 let expandedId = null;
 
+// ── Lifecycle diagnostics ─────────────────────────────────────────────────────
+// The page can show an empty table for two completely different reasons: the
+// fetch came back empty, or MyGeotab never handed the page a session at all.
+// From the outside those look identical, so the page reports which one it is.
+const PAGE  = 'REPORTS';   // names this page in console traces and error reports
+const BUILD = '2026-08-17c';
+
+// Console-only trace. The on-screen pill came out once the shared-scope bug was
+// fixed; these lines cost nothing, are invisible to the user, and are the first
+// thing to ask for when a database reports the page behaving oddly.
+function logNote(event) {
+  const d = new Date();
+  const t = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+  console.log('[Add-in ' + PAGE + ' ' + t + '] ' + event);
+}
+
+// Whatever failed, say so on the page. MyGeotab's own banner names only 'default.js'.
+function reportError(where, e) {
+  const msg = (e && e.message) || String(e);
+  console.error('[Add-in ' + PAGE + '] ' + where + ' threw', e);
+  let box = document.getElementById(ERR_ID);
+  if (!box) {
+    box = document.createElement('div');
+    box.id = ERR_ID;
+    box.title = 'Click to copy, double-click to dismiss';
+    box.style.cssText = 'position:fixed;left:10px;bottom:10px;right:10px;max-width:900px;z-index:10000;'
+      + 'font:11px/1.6 ui-monospace,Menlo,Consolas,monospace;background:#7f1d1d;color:#fee2e2;'
+      + 'padding:8px 12px;border-radius:8px;white-space:pre-wrap;cursor:pointer;max-height:40vh;overflow:auto;';
+    box.ondblclick = function() { box.remove(); };
+    box.onclick = function() {
+      if (navigator.clipboard) navigator.clipboard.writeText(box.textContent);
+    };
+    document.body.appendChild(box);
+  }
+  box.textContent = PAGE + ' · ' + where + '\n' + msg + '\n\n'
+    + ((e && e.stack) ? e.stack : '(no stack)');
+}
+
+// Errors thrown out of a timer or an api callback never pass through the lifecycle
+// functions, so catch them at the window too. Both add-in pages share this document,
+// so each only claims errors raised while it is the page on screen.
+const ERR_ID = 'diagErr-' + PAGE;
+let _focused = false;
+window.addEventListener('error', function(ev) {
+  if (!_focused) return;
+  reportError('window.onerror', ev.error || new Error(ev.message));
+});
+window.addEventListener('unhandledrejection', function(ev) {
+  if (!_focused) return;
+  reportError('unhandled promise', ev.reason instanceof Error ? ev.reason : new Error(String(ev.reason)));
+});
+
 // ── MyGeotab add-in lifecycle ─────────────────────────────────────────────────
-if (typeof geotab === 'undefined') { var geotab = { addin: {} }; }
+// Registration has to land on the host's global object, not on this closure, or
+// MyGeotab will never find it. The other add-in page shares this object.
+const geotab = window.geotab = window.geotab || {};
+if (!geotab.addin) geotab.addin = {};
+// initialize() fires once per session. focus() fires every time the user
+// navigates back to this page, and used to reload only part of the data, which
+// is why switching between the two add-in pages showed stale or empty tables.
+// Both now go through boot(), so a return visit always shows current data.
+// An exception escaping any of these three gets reported by MyGeotab as
+// "Add-In 'default.js' threw an error", which names neither the page, the callback,
+// nor the line. Catch it here so the page can say what actually failed.
+function lifecycleGuard(name, fn) {
+  return function() {
+    try {
+      return fn.apply(null, arguments);
+    } catch (e) {
+      reportError(name, e);
+    }
+  };
+}
+
 geotab.addin.vehicleChecklistDashboard = function() {
   return {
-    initialize: function(api, state, callback) {
-      _api = api;
-      if (state && state.database) {
-        document.getElementById('dbBadge').textContent = state.database;
-      } else {
-        api.getSession(function(session) {
-          if (session && session.database) document.getElementById('dbBadge').textContent = session.database;
-        });
-      }
-      callback();
-      loadData();
-      loadGdConfig(null);
-      loadIssueRecords();
-    },
-    focus: function(api, state) { _api = api; loadData(); loadGdConfig(null); },
-    blur: function() {}
+    initialize: lifecycleGuard('initialize', function(api, state, callback) {
+      _focused = true; logNote('initialize');
+      callback();                 // release MyGeotab before doing any work
+      showDatabase(api, state);
+      boot(api, true);
+    }),
+    focus: lifecycleGuard('focus', function(api, state) {
+      _focused = true; logNote('focus');
+      showDatabase(api, state);
+      boot(api, false);           // refetch only if the data has gone stale
+    }),
+    blur: lifecycleGuard('blur', function() {
+      _focused = false; logNote('blur');
+    })
   };
 };
 
-// ── Data loading ──────────────────────────────────────────────────────────────
-function loadData() {
+function showDatabase(api, state) {
+  var badge = document.getElementById('dbBadge');
+  if (!badge) return;
+  if (state && state.database) { badge.textContent = state.database; return; }
+  if (badge.textContent && badge.textContent !== '—') return;
+  if (api && api.getSession) {
+    api.getSession(function(session) {
+      if (session && session.database) badge.textContent = session.database;
+    });
+  }
+}
+
+// One fetch feeds submissions, issues and the Drive config. They used to be
+// three separate Get calls for the identical AddInData set, so every focus
+// pulled the whole table three times over.
+var _booting      = false;
+var _lastLoadedAt = 0;
+var BOOT_STALE_MS = 30000;
+
+function boot(api, force) {
+  if (api) { _api = api; }
+  if (!_api) return;
+  if (_booting) return;
+  if (!force && _lastLoadedAt && Date.now() - _lastLoadedAt < BOOT_STALE_MS) {
+    applyFilters();               // fresh enough — just repaint
+    return;
+  }
+  _booting = true;
+  hideBridgeWait();
   setLoading(true);
-  _api.call('Get', {
-    typeName: 'AddInData',
-    search: { addInId: ADDIN_ID }
-  }, function(results) {
-    RESPONSES = results
-      .map(function(r) {
-        var d = r.details || null;
-        if (d && d.type === 'ChecklistResponse') {
-          d._addInDataId = r.id;
-          return d;
-        }
-        return null;
-      })
-      .filter(Boolean)
-      .sort(function(a, b) { return new Date(b.submittedAt) - new Date(a.submittedAt); });
-    buildFilterOptions();
-    applyFilters(); // renderKPIs + renderKpiChart called inside applyFilters
-    checkRetention();
+  _api.call('Get', { typeName: 'AddInData', search: { addInId: ADDIN_ID } }, function(results) {
+    applyAddInData(results || []);
+    _lastLoadedAt = Date.now();
+    _booting = false;
     setLoading(false);
+    logNote('fetch ok — ' + (results || []).length + ' AddInData record(s), ' + RESPONSES.length + ' submission(s)');
   }, function(err) {
     console.error('AddInData fetch failed', err);
+    _booting = false;
     setLoading(false);
+    logNote('fetch failed — ' + ((err && err.message) || String(err)));
+    var text = document.getElementById('loadingStateText');
+    if (text) text.textContent = 'Could not load submissions: ' + ((err && err.message) || err);
   });
+}
+
+function applyAddInData(results) {
+  RESPONSES = [];
+  ISSUE_RECORDS = [];
+  var cfg = null;
+  results.forEach(function(r) {
+    var d = r.details;
+    if (!d) return;
+    if (d.type === 'ChecklistResponse')      { d._addInDataId = r.id; RESPONSES.push(d); }
+    else if (d.type === 'IssueStatus')       { ISSUE_RECORDS.push(d); }
+    else if (d.type === 'GoogleDriveConfig' && !cfg) { cfg = d; }
+  });
+  RESPONSES.sort(function(a, b) { return new Date(b.submittedAt) - new Date(a.submittedAt); });
+  _gdConfig = cfg;
+  buildFilterOptions();
+  applyFilters();                 // renderKPIs + renderKpiChart run inside
+  checkRetention();
+  if (_gdConfig) loadStorageInfo();
 }
 
 function setLoading(on) {
@@ -1413,10 +1538,11 @@ function expandedRow(r) {
   const items = r.items || [];
   const itemsHtml = items.length > 0
     ? items.map(item => {
-        const isFail = item.value === 'fail' || item.value === 'no';
-        const isPass = item.value === 'pass' || item.value === 'yes';
+        const isPicture = item.type === 'picture_required';
+        const isFail = !isPicture && (item.value === 'fail' || item.value === 'no');
+        const isPass = !isPicture && (item.value === 'pass' || item.value === 'yes');
         const colorClass = isFail ? 'item-fail' : isPass ? 'item-pass' : 'item-na';
-        const icon = isFail ? '✕' : isPass ? '✓' : '—';
+        const icon = isPicture ? '📷' : isFail ? '✕' : isPass ? '✓' : '—';
         const itemPhotoIds = item.gdItemPhotoIds && item.gdItemPhotoIds.length ? item.gdItemPhotoIds : [];
         const itemPhotoBtn = itemPhotoIds.length
           ? `<button onclick="openItemPhotoPopover(event,'${r.id}','${item.id}')"
@@ -1434,7 +1560,7 @@ function expandedRow(r) {
               ${item.note ? `<p class="text-xs text-slate-400 mt-0.5 italic">${item.note}</p>` : ''}
               ${itemPhotoBtn}
             </div>
-            <span class="text-xs text-slate-500 shrink-0 ${colorClass}">${item.value || '—'}</span>
+            <span class="text-xs text-slate-500 shrink-0 ${colorClass}">${isPicture ? (item.photoCount > 0 ? item.photoCount + ' photo' + (item.photoCount > 1 ? 's' : '') : '—') : (item.value || '—')}</span>
           </div>`;
       }).join('')
     : '<p class="text-xs text-slate-400 py-4 text-center">No items recorded</p>';
@@ -1882,19 +2008,6 @@ function renderPhotoThumbs() {
 }
 
 var _gdConfig = null;
-
-function loadGdConfig(onDone) {
-  _api.call('Get', { typeName: 'AddInData', search: { addInId: ADDIN_ID } }, function(results) {
-    for (var i = 0; i < results.length; i++) {
-      if (results[i].details && results[i].details.type === 'GoogleDriveConfig') {
-        _gdConfig = results[i].details;
-        break;
-      }
-    }
-    if (_gdConfig) loadStorageInfo(); // load storage once config is confirmed
-    if (onDone) onDone();
-  }, function() { if (onDone) onDone(); });
-}
 
 function gdRefreshToken(onSuccess, onError) {
   if (!_gdConfig || !_gdConfig.refreshToken) { onError('No Google Drive config'); return; }
@@ -3373,14 +3486,6 @@ function submitRaiseIssue() {
   });
 }
 
-function loadIssueRecords() {
-  if (!_api) return;
-  _api.call('Get', { typeName: 'AddInData', search: { addInId: ADDIN_ID } }, function(results) {
-    ISSUE_RECORDS = (results || []).map(function(r) { return r.details; }).filter(function(d) { return d && d.type === 'IssueStatus'; });
-    renderKPIs(filtered.length ? filtered : RESPONSES);
-  }, function() {});
-}
-
 // Issue status config
 var ISSUE_STATUSES = [
   { key: 'flagged',      label: 'Flagged',      color: '#dc2626', bg: '#fee2e2' },
@@ -4025,14 +4130,74 @@ function getRangeLabel() {
 // ── Init ──────────────────────────────────────────────────────────────────────
 renderCalendar();
 applyFilters(); // renders empty table until MyGeotab calls initialize()
+logNote('page loaded, build ' + BUILD);
 
-// Auto-reload once if initialize() hasn't fired (MyGeotab cold-load behaviour)
-if (!sessionStorage.getItem('dash_reloaded')) {
-  sessionStorage.setItem('dash_reloaded', '1');
-  setTimeout(function() { if (!_api) window.location.reload(); }, 1500);
-} else {
-  sessionStorage.removeItem('dash_reloaded');
+// The page used to reload itself if initialize() had not fired within 1.5s.
+// That reload happened inside the iframe without telling MyGeotab, which still
+// held a handle to the old add-in object and had no reason to call initialize
+// again — so the page came back permanently empty and only a full browser
+// refresh recovered it. Say what is happening instead, and let the user decide.
+function hideBridgeWait() {
+  var el = document.getElementById('bridgeWaitState');
+  if (el) el.classList.add('hidden');
 }
+
+setTimeout(function() {
+  if (_api) return;
+  var el = document.getElementById('bridgeWaitState');
+  if (el) el.classList.remove('hidden');
+  console.warn('[Add-in] MyGeotab has not called initialize() after 3s');
+}, 3000);
+
+// ── Handlers the markup calls ─────────────────────────────────────────────────
+// Inline onclick/oninput attributes are evaluated against the host's global scope,
+// so the functions they name have to be reachable there. These are the only names
+// this page publishes; everything else above stays private. Add to this list when
+// you add an inline handler, or the button will silently do nothing.
+//
+// These land on the object MyGeotab's own code uses, so anything already there is
+// worth knowing about — overwriting a host global is a good way to break the portal
+// in a way that surfaces only as "Add-In threw an error".
+function publish(map) {
+  const taken = Object.keys(map).filter(n => n in window);
+  if (taken.length) console.warn('[Add-in ' + PAGE + '] overwriting existing globals: ' + taken.join(', '));
+  Object.assign(window, map);
+}
+
+publish({
+    addIssueComment: addIssueComment, advanceIssue: advanceIssue,
+    applyCustomStorageRange: applyCustomStorageRange, applyFilters: applyFilters,
+    calClickDay: calClickDay, calNavArrow: calNavArrow, calNextMonth: calNextMonth,
+    calPrevMonth: calPrevMonth, clearFilters: clearFilters,
+    closeCompliancePanel: closeCompliancePanel, closeConfirmModal: closeConfirmModal,
+    closeExportConfirm: closeExportConfirm, closeIncidentsPanel: closeIncidentsPanel,
+    closeIssueExportModal: closeIssueExportModal, closeIssuesPanel: closeIssuesPanel,
+    closePassRatePanel: closePassRatePanel, closePhotoFullView: closePhotoFullView,
+    closePhotoPopover: closePhotoPopover, closePhotosPanel: closePhotosPanel,
+    closeRaiseIssueModal: closeRaiseIssueModal, closeStoragePanel: closeStoragePanel,
+    closeSubmissionsPanel: closeSubmissionsPanel,
+    confirmDeleteSubmission: confirmDeleteSubmission, confirmExportAll: confirmExportAll,
+    dismissIssue: dismissIssue, executeStorageAction: executeStorageAction,
+    exportArchive: exportArchive, exportIssues: exportIssues,
+    exportSubmissionPDF: exportSubmissionPDF, initiateStorage: initiateStorage,
+    nextPhoto: nextPhoto, openCompliancePanel: openCompliancePanel,
+    openIssueExportModal: openIssueExportModal, openItemPhotoPopover: openItemPhotoPopover,
+    openItemPhotoPopoverById: openItemPhotoPopoverById, openKpiPanel: openKpiPanel,
+    openPhotoFullView: openPhotoFullView, openPhotoPopover: openPhotoPopover,
+    openRaiseIssueModal: openRaiseIssueModal, openStoragePanel: openStoragePanel,
+    prevPhoto: prevPhoto, purgeOldRecords: purgeOldRecords,
+    renderCompliancePanel: renderCompliancePanel,
+    renderFailureFrequency: renderFailureFrequency, renderPassRatePanel: renderPassRatePanel,
+    renderSubmissionsPanel: renderSubmissionsPanel, runExportAll: runExportAll,
+    selectKpiTile: selectKpiTile, setIssueStatus: setIssueStatus, setPRFilter: setPRFilter,
+    setSubFilter: setSubFilter, setSubView: setSubView, stepCalMode: stepCalMode,
+    submitRaiseIssue: submitRaiseIssue, switchIssuesTab: switchIssuesTab,
+    toggleDismissed: toggleDismissed, togglePhotoDetail: togglePhotoDetail,
+    toggleRaiseSide: toggleRaiseSide, toggleResolved: toggleResolved, toggleRow: toggleRow,
+    updateConfirmBtn: updateConfirmBtn
+});
+
+})();
 </script>
 </body>
 </html>

@@ -22,6 +22,11 @@
   .slider:before { content:''; position:absolute; height:18px; width:18px; left:3px; bottom:3px; background:white; border-radius:50%; transition:.25s; }
   input:checked+.slider { background:#0047BB; }
   input:checked+.slider:before { transform:translateX(20px); }
+  /* Compact variant of .toggle for the item rows */
+  .toggle-sm { position:relative; width:34px; height:18px; display:inline-block; flex-shrink:0; }
+  .toggle-sm input { opacity:0; width:0; height:0; }
+  .toggle-sm .slider:before { height:14px; width:14px; left:2px; bottom:2px; }
+  .toggle-sm input:checked+.slider:before { transform:translateX(16px); }
   .sidebar-item.active { background:#eff6ff; border-color:#93c5fd; }
   .assign-btn { border:2px solid #e2e8f0; border-radius:12px; padding:12px; text-align:center; cursor:pointer; transition:all .2s; background:white; width:100%; }
   .assign-btn.active { border-color:#0047BB; background:#eff6ff; }
@@ -88,13 +93,16 @@
         <svg class="w-5 h-5 text-green-500 shrink-0 mt-0.5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"/></svg>
         <div>
           <p class="text-sm font-semibold text-green-800">Google Drive connected</p>
-          <p id="driveConnectedEmail" class="text-xs text-green-600 mt-0.5"></p>
+          <p id="driveConnectedEmail" class="text-sm text-green-700 font-medium mt-0.5 break-all"></p>
         </div>
       </div>
       <div class="bg-slate-50 rounded-xl p-4 space-y-1">
         <p class="text-xs font-semibold text-slate-500 uppercase tracking-widest">Photos are saved to:</p>
         <p class="text-sm text-slate-700 font-mono">My Drive / Vehicle Check-In / ...</p>
       </div>
+      <button onclick="startGoogleAuth()" class="w-full py-2.5 rounded-xl text-sm font-medium border border-slate-300 text-slate-600 hover:bg-slate-50 transition-colors">
+        Connect a different Google account
+      </button>
       <button onclick="disconnectGoogleDrive()" class="w-full py-2.5 rounded-xl text-sm font-medium border border-red-200 text-red-500 hover:bg-red-50 transition-colors">
         Disconnect Google Drive
       </button>
@@ -267,6 +275,7 @@
             <option value="yes_no">Yes / No</option>
             <option value="number">Number</option>
             <option value="text">Text</option>
+            <option value="picture_required">Picture Required</option>
           </select>
           <button id="saveCustomToggle" onclick="toggleSaveCustom()" title="Also save this custom item to My Custom Checks for reuse"
                   style="border:1.5px solid #e2e8f0;border-radius:8px;padding:0 12px;font-size:12px;font-weight:700;color:#64748b;background:white;cursor:pointer;white-space:nowrap;">&#9734; Save</button>
@@ -285,6 +294,16 @@
 </div>
 
 <script>
+// MyGeotab does not put add-in pages in an iframe. It fetches the HTML and injects
+// it into its own document, so every add-in page in the solution runs in ONE shared
+// global scope. Two pages declaring the same top-level `const` is a SyntaxError, and
+// a SyntaxError kills the whole block before its first statement — the second page
+// loaded would never register its add-in, never be handed an api, and sit there
+// empty until the browser was reloaded. Everything below is therefore closed over,
+// and the handful of names the inline markup calls are published deliberately at the
+// bottom of this file. Nothing else may leak.
+(function() {
+
 const ADDIN_ID = 'a1Z2QF2s8nkajnj2rcMUsPQ';
 
 // ── Preset item library ───────────────────────────────────────────────────────
@@ -327,7 +346,7 @@ const PRESET_CATEGORIES = [
   ]},
 ];
 
-const TYPE_LABEL = { pass_fail:'Pass/Fail', yes_no:'Yes/No', number:'Number', text:'Text' };
+const TYPE_LABEL = { pass_fail:'Pass/Fail', yes_no:'Yes/No', number:'Number', text:'Text', picture_required:'Picture Required' };
 const PRESET_LABELS = new Set(PRESET_CATEGORIES.flatMap(c => c.items.map(i => i.label)));
 
 let DRIVERS       = [];
@@ -347,22 +366,114 @@ let selectedPresets = new Map();
 var _api = null;
 
 // ── MyGeotab Add-In entry point ───────────────────────────────────────────────
-if (typeof geotab === 'undefined') { var geotab = { addin: {} }; }
+// Registration has to land on the host's global object, not on this closure, or
+// MyGeotab will never find it. The other add-in page shares this object.
+const geotab = window.geotab = window.geotab || {};
+if (!geotab.addin) geotab.addin = {};
+// ── Lifecycle diagnostics ─────────────────────────────────────────────────────
+// An empty sidebar means either "the database has no checklists" or "MyGeotab
+// never handed this page a session". Those look identical on screen, so the page
+// reports which one actually happened.
+const PAGE  = 'BUILDER';   // names this page in console traces and error reports
+const BUILD = '2026-08-17c';
+
+// Console-only trace. The on-screen pill came out once the shared-scope bug was
+// fixed; these lines cost nothing, are invisible to the user, and are the first
+// thing to ask for when a database reports the page behaving oddly.
+function logNote(event) {
+  const d = new Date();
+  const t = ('0' + d.getHours()).slice(-2) + ':' + ('0' + d.getMinutes()).slice(-2) + ':' + ('0' + d.getSeconds()).slice(-2);
+  console.log('[Add-in ' + PAGE + ' ' + t + '] ' + event);
+}
+
+// Whatever failed, say so on the page. MyGeotab's own banner names only 'default.js'.
+function reportError(where, e) {
+  const msg = (e && e.message) || String(e);
+  console.error('[Add-in ' + PAGE + '] ' + where + ' threw', e);
+  let box = document.getElementById(ERR_ID);
+  if (!box) {
+    box = document.createElement('div');
+    box.id = ERR_ID;
+    box.title = 'Click to copy, double-click to dismiss';
+    box.style.cssText = 'position:fixed;left:10px;bottom:10px;right:10px;max-width:900px;z-index:10000;'
+      + 'font:11px/1.6 ui-monospace,Menlo,Consolas,monospace;background:#7f1d1d;color:#fee2e2;'
+      + 'padding:8px 12px;border-radius:8px;white-space:pre-wrap;cursor:pointer;max-height:40vh;overflow:auto;';
+    box.ondblclick = function() { box.remove(); };
+    box.onclick = function() {
+      if (navigator.clipboard) navigator.clipboard.writeText(box.textContent);
+    };
+    document.body.appendChild(box);
+  }
+  box.textContent = PAGE + ' · ' + where + '\n' + msg + '\n\n'
+    + ((e && e.stack) ? e.stack : '(no stack)');
+}
+
+// Errors thrown out of a timer or an api callback never pass through the lifecycle
+// functions, so catch them at the window too. Both add-in pages share this document,
+// so each only claims errors raised while it is the page on screen.
+const ERR_ID = 'diagErr-' + PAGE;
+let _focused = false;
+window.addEventListener('error', function(ev) {
+  if (!_focused) return;
+  reportError('window.onerror', ev.error || new Error(ev.message));
+});
+window.addEventListener('unhandledrejection', function(ev) {
+  if (!_focused) return;
+  reportError('unhandled promise', ev.reason instanceof Error ? ev.reason : new Error(String(ev.reason)));
+});
+
+
+// initialize() fires once per session; focus() fires every time the user
+// navigates back to this page. focus() used to re-render from memory only, so a
+// template saved on another tab — or on this one before a reload — never showed
+// up without a browser refresh. Both entry points now go through boot().
+// An exception escaping any of these three gets reported by MyGeotab as
+// "Add-In 'default.js' threw an error", which names neither the page, the callback,
+// nor the line. Catch it here so the page can say what actually failed.
+function lifecycleGuard(name, fn) {
+  return function() {
+    try {
+      return fn.apply(null, arguments);
+    } catch (e) {
+      reportError(name, e);
+    }
+  };
+}
+
 geotab.addin.vehicleChecklistBuilder = function() {
   return {
-    initialize: function(api, state, callback) {
-      _api = api;
-      callback();
-      loadFromApi();
-    },
-    focus: function(api, state) {
-      _api = api;
-      renderSidebar();
-      selectTemplate(activeId);
-    },
-    blur: function() {}
+    initialize: lifecycleGuard('initialize', function(api, state, callback) {
+      _focused = true; logNote('initialize');
+      callback();                 // release MyGeotab before doing any work
+      boot(api, true);
+    }),
+    focus: lifecycleGuard('focus', function(api, state) {
+      _focused = true; logNote('focus');
+      boot(api, false);           // refetch only if what we hold has gone stale
+    }),
+    blur: lifecycleGuard('blur', function() {
+      _focused = false; logNote('blur');
+    })
   };
 };
+
+// One entry point for loading, safe to call repeatedly.
+let _booting      = false;
+let _lastLoadedAt = 0;
+const BOOT_STALE_MS = 30000;
+
+function boot(api, force) {
+  if (api) { _api = api; }
+  if (!_api) return;
+  hideBridgeWait();
+  if (_booting) return;
+  if (!force && _lastLoadedAt && Date.now() - _lastLoadedAt < BOOT_STALE_MS) {
+    renderSidebar();              // fresh enough — just repaint
+    return;
+  }
+  _booting = true;
+  loadFromApi();
+}
 
 function loadFromApi() {
   if (!_api) return;
@@ -373,38 +484,16 @@ function loadFromApi() {
     typeName: 'AddInData',
     search: { addInId: ADDIN_ID }
   }, function(results) {
-    const loaded = results
-      .map(function(r) {
-        try {
-          const d = r.details;
-          if (d && d.type === 'ChecklistTemplate') {
-            d.addInDataId = r.id;
-            return d;
-          }
-          if (d && d.type === 'CustomItemLibrary') {
-            LIBRARY = { addInDataId: r.id, items: Array.isArray(d.items) ? d.items : [], favourites: Array.isArray(d.favourites) ? d.favourites : [] };
-          }
-        } catch(e) {}
-        return null;
-      })
-      .filter(Boolean);
-
-    if (loaded.length > 0) {
-      templates = loaded;
-      activeId = templates[0].id;
-    } else {
-      // Nothing saved yet — start with one blank template
-      const blank = { id: 'cl-' + Date.now(), name: 'New Checklist', assignTo: 'driver', assigned: [], requirePhotos: true, tripType: 'na', items: [] };
-      templates = [blank];
-      activeId = blank.id;
-    }
+    applyAddInData(results || []);
+    _lastLoadedAt = Date.now();
+    _booting = false;
     document.getElementById('dataSourceBadge').classList.add('hidden');
-    renderSidebar();
-    selectTemplate(activeId);
-    updateConflictIndicator();
-    loadGdConfig();
-  }, function() {
+    logNote('fetch ok — ' + (results || []).length + ' AddInData record(s), ' + templates.length + ' template(s)');
+  }, function(err) {
+    console.error('AddInData fetch failed', err);
+    _booting = false;
     document.getElementById('dataSourceBadge').classList.add('hidden');
+    logNote('fetch failed — ' + ((err && err.message) || String(err)));
   });
 
   // Load real drivers
@@ -446,6 +535,92 @@ function loadFromApi() {
       renderAssignList();
     }
   }, function() {});
+}
+
+// What each template looked like on the server the last time we read it. A local
+// copy that no longer matches its snapshot has unsaved edits, and a refetch must
+// not throw those away.
+let _serverSnapshot = {};
+
+function templateFingerprint(t) {
+  return JSON.stringify({
+    name: t.name, assignTo: t.assignTo, assigned: t.assigned,
+    requirePhotos: t.requirePhotos, tripType: t.tripType || 'na', items: t.items
+  });
+}
+
+// One AddInData read feeds templates, the custom-item library and the Drive
+// config. They used to be two separate reads of the identical record set.
+function applyAddInData(results) {
+  const loaded = [];
+  let gdConfig = null, gdConfigId = null;
+
+  results.forEach(function(r) {
+    const d = r.details;
+    if (!d) return;
+    if (d.type === 'ChecklistTemplate') { d.addInDataId = r.id; loaded.push(d); }
+    else if (d.type === 'CustomItemLibrary') {
+      LIBRARY = { addInDataId: r.id, items: Array.isArray(d.items) ? d.items : [], favourites: Array.isArray(d.favourites) ? d.favourites : [] };
+    }
+    else if (d.type === GD_CONFIG_TYPE && !gdConfig) { gdConfig = d; gdConfigId = r.id; }
+  });
+
+  const byId = {};
+  templates.forEach(t => { byId[t.id] = t; });
+
+  const merged = loaded.map(function(incoming) {
+    const local = byId[incoming.id];
+    // Keep the local copy when it has drifted from what the server last gave us —
+    // those are edits the user has made and not yet saved.
+    if (local && _serverSnapshot[incoming.id] !== undefined
+        && templateFingerprint(local) !== _serverSnapshot[incoming.id]) {
+      local.addInDataId = incoming.addInDataId;
+      return local;
+    }
+    return incoming;
+  });
+
+  // Templates created here but never saved have no server record yet, so they are
+  // absent from the fetch. Carry them across rather than making them vanish.
+  templates.forEach(function(t) {
+    if (!t.addInDataId && !merged.some(m => m.id === t.id)) merged.push(t);
+  });
+
+  _serverSnapshot = {};
+  loaded.forEach(t => { _serverSnapshot[t.id] = templateFingerprint(t); });
+
+  const previousId = activeId;
+  if (merged.length > 0) {
+    templates = merged;
+    if (!templates.some(t => t.id === activeId)) activeId = templates[0].id;
+  } else {
+    // Nothing saved yet — start with one blank template
+    const blank = { id: 'cl-' + Date.now(), name: 'New Checklist', assignTo: 'driver', assigned: [], requirePhotos: true, tripType: 'na', items: [] };
+    templates = [blank];
+    activeId = blank.id;
+  }
+
+  renderSidebar();
+  // selectTemplate() rewrites the form from the template object, so calling it on
+  // every focus would wipe whatever the user had typed but not yet saved. Only do
+  // it when the selection actually moved.
+  if (activeId !== previousId || previousId === null) selectTemplate(activeId);
+  updateConflictIndicator();
+  applyGdConfig(gdConfig, gdConfigId);
+}
+
+function applyGdConfig(details, addInDataId) {
+  if (!details) {
+    // Disconnected here or in another session — reflect that rather than keeping
+    // a connected badge over credentials that no longer exist.
+    GD_CONFIG = null;
+    showDriveDisconnected();
+    return;
+  }
+  GD_CONFIG = details;
+  GD_CONFIG._addInDataId = addInDataId;
+  document.getElementById('driveBtnLabel').textContent = '✓ Drive Connected';
+  document.getElementById('driveBtn').style.background = 'rgba(34,197,94,0.25)';
 }
 
 // Build deduplicated group lists from loaded data
@@ -664,6 +839,18 @@ function renderItems() {
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z"/>
         </svg>
       </button>`;
+    // Photo required toggle — not offered on picture_required (already photo-only)
+    const photoOn  = item.photoRequired === true;
+    const photoTgl = item.type === 'picture_required' ? '' : `
+      <div class="flex items-center gap-1.5 shrink-0" title="Require a photo on this item whatever the answer">
+        <span class="text-[11px] text-slate-400 whitespace-nowrap">Photo required</span>
+        <label class="toggle toggle-sm">
+          <input type="checkbox" ${photoOn ? 'checked' : ''} onchange="updatePhotoRequired('${item.id}', this.checked)">
+          <span class="slider"></span>
+        </label>
+        <span id="photoReqWord-${item.id}" class="text-[11px] font-semibold w-6"
+              style="color:${photoOn ? '#0047BB' : '#94a3b8'};">${photoOn ? 'Yes' : 'No'}</span>
+      </div>`;
     return `
     <div class="flex items-center gap-3 bg-slate-50 border border-slate-100 rounded-xl px-3 py-2.5" data-item-idx="${idx}">
       <span onpointerdown="dragStart(event, ${idx})" title="Drag to reorder"
@@ -675,6 +862,7 @@ function renderItems() {
              class="flex-1 text-sm text-slate-700 bg-transparent focus:outline-none min-w-0"
              oninput="updateLabel('${item.id}', this.value)">
       ${saveBtn}
+      ${photoTgl}
       <select onchange="updateType('${item.id}', this.value)"
               class="text-xs text-slate-500 bg-white border border-slate-200 rounded-lg px-2 py-1.5 focus:outline-none focus:border-blue-400 shrink-0">
         ${Object.entries(TYPE_LABEL).map(([v,l]) => `<option value="${v}" ${item.type===v?'selected':''}>${l}</option>`).join('')}
@@ -755,7 +943,19 @@ function removeItem(id) {
 }
 
 function updateLabel(id, val) { getActive().items.find(i=>i.id===id).label = val; renderApiPreview(); }
-function updateType(id, val)  { getActive().items.find(i=>i.id===id).type  = val; renderApiPreview(); }
+
+// Re-renders the row: switching to/from picture_required shows or hides the photo toggle
+function updateType(id, val)  { getActive().items.find(i=>i.id===id).type = val; renderItems(); renderApiPreview(); }
+
+function updatePhotoRequired(id, checked) {
+  getActive().items.find(i=>i.id===id).photoRequired = checked;
+  const word = document.getElementById('photoReqWord-' + id);
+  if (word) {
+    word.textContent   = checked ? 'Yes' : 'No';
+    word.style.color   = checked ? '#0047BB' : '#94a3b8';
+  }
+  renderApiPreview();
+}
 
 // ── Add Item Modal ────────────────────────────────────────────────────────────
 function openAddItemModal() {
@@ -876,7 +1076,7 @@ function addSelectedItems() {
 
   // Add selected presets
   selectedPresets.forEach((type, label) => {
-    t.items.push({ id: 'i' + Date.now() + Math.random().toString(36).slice(2,6), label, type });
+    t.items.push({ id: 'i' + Date.now() + Math.random().toString(36).slice(2,6), label, type, photoRequired: false });
     added++;
   });
 
@@ -884,7 +1084,7 @@ function addSelectedItems() {
   const customLabel = document.getElementById('customLabel').value.trim();
   if (customLabel) {
     const customType = document.getElementById('customType').value;
-    t.items.push({ id: 'i' + Date.now(), label: customLabel, type: customType });
+    t.items.push({ id: 'i' + Date.now(), label: customLabel, type: customType, photoRequired: false });
     added++;
     if (saveCustomFlag && !isInLibrary(customLabel)) {
       LIBRARY.items.push({ label: customLabel, type: customType });
@@ -961,7 +1161,7 @@ function newChecklist() {
   const t = {
     id:'cl-'+Date.now(), name:'New Checklist', assignTo:'driver', assigned:[], requirePhotos:true,
     items:[
-      { id:'bodywork-'+Date.now(), label:'Bodywork check — any damage?', type:'pass_fail', isBodywork:true }
+      { id:'bodywork-'+Date.now(), label:'Bodywork check — any damage?', type:'pass_fail', isBodywork:true, photoRequired:false }
     ]
   };
   templates.unshift(t);
@@ -1022,16 +1222,24 @@ function saveChecklist() {
     toast('Save failed: ' + (msg || 'unknown error'));
   }
 
+  // Once saved, this template matches the server again — record that, or the next
+  // focus would treat it as unsaved and refuse to take fresher server data.
+  function onSaved() {
+    _serverSnapshot[t.id] = templateFingerprint(t);
+    toast('Saved to MyGeotab');
+    updateConflictIndicator();
+  }
+
   if (t.addInDataId) {
     _api.call('Set', {
       typeName: 'AddInData',
       entity: { id: t.addInDataId, addInId: ADDIN_ID, details: payload }
-    }, function() { toast('Saved to MyGeotab'); updateConflictIndicator(); }, onSaveErr);
+    }, onSaved, onSaveErr);
   } else {
     _api.call('Add', {
       typeName: 'AddInData',
       entity: { addInId: ADDIN_ID, details: payload }
-    }, function(id) { t.addInDataId = id; toast('Saved to MyGeotab'); updateConflictIndicator(); }, onSaveErr);
+    }, function(id) { t.addInDataId = id; onSaved(); }, onSaveErr);
   }
 }
 
@@ -1094,7 +1302,10 @@ async function startGoogleAuth() {
     + '&response_type=code'
     + '&scope='                 + encodeURIComponent(scope)
     + '&access_type=offline'
-    + '&prompt=consent'
+    // select_account forces the account chooser. Without it Google silently
+    // reuses whichever account the browser is already signed into, so a
+    // reconnect can land on the wrong Drive without ever asking.
+    + '&prompt=' + encodeURIComponent('consent select_account')
     + '&code_challenge='        + encodeURIComponent(challenge)
     + '&code_challenge_method=S256';
   window.open(url, '_blank');
@@ -1220,19 +1431,6 @@ function saveGdConfig(config) {
         function(err) { toast('Save failed: ' + (err && err.message || 'unknown')); });
     }
   }, function() { toast('Could not save config'); });
-}
-
-function loadGdConfig() {
-  if (!_api) return;
-  _api.call('Get', { typeName: 'AddInData', search: { addInId: ADDIN_ID } }, function(results) {
-    const config = results.find(r => r.details && r.details.type === GD_CONFIG_TYPE);
-    if (config) {
-      GD_CONFIG = config.details;
-      GD_CONFIG._addInDataId = config.id;
-      document.getElementById('driveBtnLabel').textContent = '✓ Drive Connected';
-      document.getElementById('driveBtn').style.background = 'rgba(34,197,94,0.25)';
-    }
-  }, function() {});
 }
 
 function disconnectGoogleDrive() {
@@ -1399,6 +1597,7 @@ function saveConflictResolution(entityId, type) {
       typeName: 'AddInData',
       entity: { id: t.addInDataId, addInId: ADDIN_ID, details: payload }
     }, function() {
+      _serverSnapshot[t.id] = templateFingerprint(t);
       if (--remaining === 0) {
         toast('Conflicts resolved');
         delete pendingRemovals[key];
@@ -1466,14 +1665,66 @@ function testAddInData() {
 
 // ── Init ──────────────────────────────────────────────────────────────────────
 renderSidebar(); // renders empty state until MyGeotab calls initialize()
+logNote('page loaded, build ' + BUILD);
 
-// Auto-reload once if initialize() hasn't fired (MyGeotab cold-load behaviour)
-if (!sessionStorage.getItem('cb_reloaded')) {
-  sessionStorage.setItem('cb_reloaded', '1');
-  setTimeout(function() { if (!_api) window.location.reload(); }, 1500);
-} else {
-  sessionStorage.removeItem('cb_reloaded');
+// The page used to reload itself if initialize() had not fired within 1.5s. That
+// reload happened inside the iframe without telling MyGeotab, which still held a
+// handle to the old add-in object and so had no reason to call initialize again —
+// the page came back permanently empty and only a full browser refresh recovered
+// it. Say what is happening instead, and let the user decide.
+function hideBridgeWait() {
+  const el = document.getElementById('bridgeWait');
+  if (el) el.remove();
 }
+
+setTimeout(function() {
+  if (_api) return;
+  const sidebar = document.getElementById('sidebar');
+  if (sidebar && !document.getElementById('bridgeWait')) {
+    const el = document.createElement('div');
+    el.id = 'bridgeWait';
+    el.className = 'px-3 py-6 text-center';
+    el.innerHTML = '<p class="text-xs text-slate-400 leading-relaxed">Waiting for MyGeotab…<br>This page has not been handed a session yet.</p>'
+      + '<button onclick="window.location.reload()" class="mt-3 text-xs font-semibold text-white rounded-lg px-3 py-1.5" style="background:#0047BB;">Reload</button>';
+    sidebar.appendChild(el);
+  }
+  console.warn('[Add-in] MyGeotab has not called initialize() after 3s');
+}, 3000);
+
+// ── Handlers the markup calls ─────────────────────────────────────────────────
+// Inline onclick/oninput attributes are evaluated against the host's global scope,
+// so the functions they name have to be reachable there. These are the only names
+// this page publishes; everything else above stays private. Add to this list when
+// you add an inline handler, or the button will silently do nothing.
+function publish(map) {
+  const taken = Object.keys(map).filter(n => n in window);
+  if (taken.length) console.warn('[Add-in ' + PAGE + '] overwriting existing globals: ' + taken.join(', '));
+  Object.assign(window, map);
+}
+
+publish({
+    addSelectedItems: addSelectedItems, clearAllVisible: clearAllVisible,
+    closeAddItemModal: closeAddItemModal, closeConflictPanel: closeConflictPanel,
+    closeConflictPopover: closeConflictPopover, closeDriveSetup: closeDriveSetup,
+    closeModalOnBg: closeModalOnBg, deleteChecklist: deleteChecklist,
+    disconnectGoogleDrive: disconnectGoogleDrive, dragStart: dragStart,
+    duplicateChecklist: duplicateChecklist, newChecklist: newChecklist,
+    onAssignSearch: onAssignSearch, openAddItemModal: openAddItemModal,
+    openConflictPanel: openConflictPanel, openDriveSetup: openDriveSetup,
+    removeFromLibrary: removeFromLibrary, removeItem: removeItem,
+    renderApiPreview: renderApiPreview, resolveConflict: resolveConflict,
+    saveChecklist: saveChecklist, saveConflictResolution: saveConflictResolution,
+    saveToLibrary: saveToLibrary, selectAllVisible: selectAllVisible,
+    selectTemplate: selectTemplate, setAssignType: setAssignType, setModalTab: setModalTab,
+    setTripType: setTripType, showConflictPopover: showConflictPopover,
+    startGoogleAuth: startGoogleAuth, toggleAssign: toggleAssign,
+    toggleConflictEntry: toggleConflictEntry, toggleFavourite: toggleFavourite,
+    toggleGroup: toggleGroup, togglePreset: togglePreset, toggleSaveCustom: toggleSaveCustom,
+    updateLabel: updateLabel, updatePhotoRequired: updatePhotoRequired,
+    updateType: updateType
+});
+
+})();
 </script>
 </body>
 </html>
