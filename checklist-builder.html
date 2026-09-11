@@ -37,7 +37,7 @@
     <svg style="width:18px;height:18px;" fill="none" stroke="white" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4"/></svg>
   </div>
   <span style="font-size:15px;font-weight:700;color:#1e293b;">Checklist Builder</span>
-  <span style="font-size:10px;color:#cbd5e1;">v1.9</span>
+  <span style="font-size:10px;color:#cbd5e1;">v2.0</span>
   <button id="driveBtn" onclick="openDriveSetup()" style="margin-left:auto;display:flex;align-items:center;gap:6px;background:#f8fafc;border:1px solid #e2e8f0;border-radius:10px;padding:7px 14px;cursor:pointer;color:#64748b;font-size:12px;font-weight:600;box-shadow:0 1px 3px rgba(0,0,0,0.06);">
     <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 15a4 4 0 004 4h9a5 5 0 10-.1-9.999 5.002 5.002 0 10-9.78 2.096A4.001 4.001 0 003 15z"/></svg>
     <span id="driveBtnLabel">Connect Storage</span>
@@ -157,7 +157,7 @@
   <!-- Editor -->
   <main class="flex-1 overflow-y-auto p-6 space-y-5" style="background:#eef2f7;">
     <div class="flex items-start justify-between gap-4">
-      <input id="clName" type="text" placeholder="Checklist name…"
+      <input id="clName" type="text" placeholder="Checklist name…" maxlength="200"
         class="text-2xl font-bold text-slate-800 bg-transparent border-b-2 border-transparent focus:border-blue-500 focus:outline-none flex-1 pb-0.5 placeholder:text-slate-300"
         oninput="renderApiPreview()">
       <div class="flex gap-2 pt-1">
@@ -224,6 +224,20 @@
                        border-radius:50%;box-shadow:0 1px 2px rgba(0,0,0,.3);transition:left .2s;"></span>
         </button>
       </div>
+      <div class="flex items-center justify-between mb-4 pt-3 border-t border-slate-100">
+        <div>
+          <p class="text-sm font-semibold text-slate-700">Require final review and signature</p>
+          <p class="text-xs text-slate-400 mt-0.5">User must review responses and add a signee name + signature before upload</p>
+        </div>
+        <button type="button" id="reqSignoff" role="switch" aria-checked="false" class="ml-4"
+                aria-label="Require final review and signature" onclick="switchToggle('reqSignoff')"
+                style="position:relative;flex-shrink:0;width:44px;height:24px;padding:0;border:0;
+                       border-radius:999px;cursor:pointer;background:#cbd5e1;transition:background .2s;
+                       -webkit-appearance:none;appearance:none;">
+          <span data-knob style="position:absolute;top:3px;left:3px;width:18px;height:18px;background:#fff;
+                       border-radius:50%;box-shadow:0 1px 2px rgba(0,0,0,.3);transition:left .2s;"></span>
+        </button>
+      </div>
       <div class="border-t border-slate-100 pt-4">
         <p class="text-sm font-semibold text-slate-700 mb-2">Trip type</p>
         <div class="flex gap-2">
@@ -276,7 +290,7 @@
       <div>
         <p class="text-xs font-semibold text-slate-500 uppercase tracking-widest mb-2">Custom Item</p>
         <div class="flex gap-2">
-          <input id="customLabel" type="text" placeholder="Enter custom item label…"
+          <input id="customLabel" type="text" placeholder="Enter custom item label…" maxlength="500"
                  class="flex-1 border border-slate-200 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-400"
                  onkeydown="if(event.key==='Enter') addSelectedItems()">
           <select id="customType" class="border border-slate-200 rounded-lg px-2 py-2 text-sm focus:outline-none focus:border-blue-400 bg-white">
@@ -390,6 +404,16 @@ const BUILD      = '2026-08-17d';
 const ERR_ID = 'diagErr-' + PAGE;
 let _focused = false;
 let _errCount = 0;
+let _disposed = false;
+let _loadGeneration = 0;
+
+function beginLoadGeneration() {
+  return ++_loadGeneration;
+}
+
+function loadGenerationIsCurrent(generation) {
+  return !_disposed && _focused && generation === _loadGeneration;
+}
 
 // ── Re-entry teardown ─────────────────────────────────────────────────────────
 // MyGeotab re-injects and re-runs this entire script every time the page is
@@ -420,7 +444,9 @@ function onWin(type, fn, opts) {
 
 window[INSTANCE_KEY] = {
   dispose: function() {
+    _disposed = true;
     _focused = false;
+    _loadGeneration++;
     _disposers.splice(0).forEach(function(off) { try { off(); } catch (e) {} });
     const stale = document.getElementById(ERR_ID);
     if (stale) stale.remove();
@@ -581,7 +607,10 @@ geotab.addin.vehicleChecklistBuilder = function() {
       boot(api, false);           // refetch only if what we hold has gone stale
     }),
     blur: lifecycleGuard('blur', function() {
-      _focused = false; logNote('blur');
+      _focused = false;
+      _loadGeneration++;
+      _booting = false;
+      logNote('blur — pending API callbacks cancelled');
     })
   };
 };
@@ -594,6 +623,7 @@ const BOOT_STALE_MS = 30000;
 function boot(api, force) {
   if (api) { _api = api; }
   if (!_api) return;
+  _disposed = false;
   hideBridgeWait();
   if (_booting) return;
   if (!force && _lastLoadedAt && Date.now() - _lastLoadedAt < BOOT_STALE_MS) {
@@ -606,6 +636,7 @@ function boot(api, force) {
 
 function loadFromApi() {
   if (!_api) return;
+  const generation = beginLoadGeneration();
   document.getElementById('dataSourceBadge').classList.remove('hidden');
 
   // Load checklist templates from AddInData
@@ -613,12 +644,14 @@ function loadFromApi() {
     typeName: 'AddInData',
     search: { addInId: ADDIN_ID }
   }, function(results) {
+    if (!loadGenerationIsCurrent(generation)) return;
     applyAddInData(results || []);
     _lastLoadedAt = Date.now();
     _booting = false;
     document.getElementById('dataSourceBadge').classList.add('hidden');
     logNote('fetch ok — ' + (results || []).length + ' AddInData record(s), ' + templates.length + ' template(s)');
   }, function(err) {
+    if (!loadGenerationIsCurrent(generation)) return;
     console.error('AddInData fetch failed', err);
     _booting = false;
     document.getElementById('dataSourceBadge').classList.add('hidden');
@@ -627,6 +660,7 @@ function loadFromApi() {
 
   // Load real drivers
   _api.call('Get', { typeName: 'User', search: { isDriver: true } }, function(users) {
+    if (!loadGenerationIsCurrent(generation)) return;
     if (users && users.length) {
       DRIVERS = users.map(u => ({
         id: u.id,
@@ -640,6 +674,7 @@ function loadFromApi() {
 
   // Load real vehicles/devices
   _api.call('Get', { typeName: 'Device', search: {} }, function(devices) {
+    if (!loadGenerationIsCurrent(generation)) return;
     if (devices && devices.length) {
       VEHICLES = devices
         .filter(d => d.id && d.id !== 'b0')
@@ -657,6 +692,7 @@ function loadFromApi() {
 
   // Load groups (for filter chips)
   _api.call('Get', { typeName: 'Group', search: {} }, function(groups) {
+    if (!loadGenerationIsCurrent(generation)) return;
     if (groups && groups.length) {
       groups.forEach(g => { GROUP_MAP[g.id] = g.name || g.id; });
       buildDriverGroups();
@@ -674,7 +710,8 @@ let _serverSnapshot = {};
 function templateFingerprint(t) {
   return JSON.stringify({
     name: t.name, assignTo: t.assignTo, assigned: t.assigned,
-    requirePhotos: t.requirePhotos, tripType: t.tripType || 'na', items: t.items
+    requirePhotos: t.requirePhotos, requireSignoff: t.requireSignoff === true,
+    tripType: t.tripType || 'na', items: t.items
   });
 }
 
@@ -687,7 +724,11 @@ function applyAddInData(results) {
   results.forEach(function(r) {
     const d = r.details;
     if (!d) return;
-    if (d.type === 'ChecklistTemplate') { d.addInDataId = r.id; loaded.push(d); }
+    if (d.type === 'ChecklistTemplate') {
+      d.addInDataId = r.id;
+      d.requireSignoff = d.requireSignoff === true;
+      loaded.push(d);
+    }
     else if (d.type === 'CustomItemLibrary') {
       LIBRARY = { addInDataId: r.id, items: Array.isArray(d.items) ? d.items : [], favourites: Array.isArray(d.favourites) ? d.favourites : [] };
     }
@@ -724,7 +765,7 @@ function applyAddInData(results) {
     if (!templates.some(t => t.id === activeId)) activeId = templates[0].id;
   } else {
     // Nothing saved yet — start with one blank template
-    const blank = { id: 'cl-' + Date.now(), name: 'New Checklist', assignTo: 'driver', assigned: [], requirePhotos: true, tripType: 'na', items: [] };
+    const blank = { id: 'cl-' + Date.now(), name: 'New Checklist', assignTo: 'driver', assigned: [], requirePhotos: true, requireSignoff: false, tripType: 'na', items: [] };
     templates = [blank];
     activeId = blank.id;
   }
@@ -787,7 +828,7 @@ function renderSidebar() {
          style="${isActive ? 'border-color:#93c5fd; background:#eff6ff;' : ''}"
          onclick="selectTemplate('${t.id}')">
       <p class="text-sm font-medium text-slate-800 truncate">${t.name}</p>
-      <p class="text-xs text-slate-400 mt-0.5">${t.items.length} items · ${t.assignTo==='driver' ? 'By driver' : 'By vehicle'}</p>
+      <p class="text-xs text-slate-400 mt-0.5">${t.items.length} items · ${t.assignTo==='driver' ? 'By driver' : 'By vehicle'}${t.requireSignoff ? ' · Sign-off required' : ''}</p>
     </div>`;
   }).join('');
 }
@@ -805,6 +846,7 @@ function selectTemplate(id) {
   const searchEl = document.getElementById('assignSearch');
   if (searchEl) searchEl.value = '';
   switchSet('reqPhotos', t.requirePhotos !== false);
+  switchSet('reqSignoff', t.requireSignoff === true);
   setTripType(t.tripType || 'na');
   updateAssignButtons();
   renderAssignList();
@@ -992,7 +1034,7 @@ function renderItems() {
         <svg width="10" height="16" viewBox="0 0 10 16" fill="currentColor"><circle cx="2.5" cy="2.5" r="1.6"/><circle cx="7.5" cy="2.5" r="1.6"/><circle cx="2.5" cy="8" r="1.6"/><circle cx="7.5" cy="8" r="1.6"/><circle cx="2.5" cy="13.5" r="1.6"/><circle cx="7.5" cy="13.5" r="1.6"/></svg>
       </span>
       <span class="text-slate-300 text-xs select-none font-mono w-5 text-center">${idx+1}</span>
-      <input type="text" value="${escHtml(item.label)}" placeholder="Item label…"
+      <input type="text" value="${escHtml(item.label)}" placeholder="Item label…" maxlength="500"
              class="flex-1 text-sm text-slate-700 bg-transparent focus:outline-none min-w-0"
              oninput="updateLabel('${item.id}', this.value)">
       ${saveBtn}
@@ -1076,7 +1118,7 @@ function removeItem(id) {
   renderApiPreview();
 }
 
-function updateLabel(id, val) { getActive().items.find(i=>i.id===id).label = val; renderApiPreview(); }
+function updateLabel(id, val) { getActive().items.find(i=>i.id===id).label = String(val || '').slice(0, 500); renderApiPreview(); }
 
 // Re-renders the row: switching to/from picture_required shows or hides the photo toggle
 function updateType(id, val)  { getActive().items.find(i=>i.id===id).type = val; renderItems(); renderApiPreview(); }
@@ -1263,7 +1305,7 @@ function addSelectedItems() {
   });
 
   // Add custom item if filled in
-  const customLabel = document.getElementById('customLabel').value.trim();
+  const customLabel = document.getElementById('customLabel').value.trim().slice(0, 500);
   if (customLabel) {
     const customType = document.getElementById('customType').value;
     t.items.push({ id: 'i' + Date.now(), label: customLabel, type: customType, photoRequired: false });
@@ -1313,6 +1355,10 @@ function removeFromLibrary(label) {
 function persistLibrary(msg) {
   if (!_api) { toast(msg + ' (local only — not connected)'); return; }
   const payload = { type: 'CustomItemLibrary', items: LIBRARY.items, favourites: LIBRARY.favourites || [], updatedAt: new Date().toISOString() };
+  if (JSON.stringify(payload).length > 9500) {
+    toast('Custom checks are too large to save. Remove or shorten an item.');
+    return;
+  }
   function onErr(err) { console.error('Library save failed', err); toast('Library save failed'); }
   if (LIBRARY.addInDataId) {
     _api.call('Set', { typeName: 'AddInData', entity: { id: LIBRARY.addInDataId, addInId: ADDIN_ID, details: payload } },
@@ -1341,7 +1387,8 @@ function duplicateChecklist() {
 
 function newChecklist() {
   const t = {
-    id:'cl-'+Date.now(), name:'New Checklist', assignTo:'driver', assigned:[], requirePhotos:true,
+    id:'cl-'+Date.now(), name:'New Checklist', assignTo:'driver', assigned:[], requirePhotos:true, requireSignoff:false,
+    tripType:'na',
     items:[
       { id:'bodywork-'+Date.now(), label:'Bodywork check — any damage?', type:'pass_fail', isBodywork:true, photoRequired:false }
     ]
@@ -1368,7 +1415,7 @@ function deleteChecklist() {
 
 function saveChecklist() {
   const t = getActive();
-  const newName = document.getElementById('clName').value.trim() || 'Untitled';
+  const newName = document.getElementById('clName').value.trim().slice(0, 200) || 'Untitled';
 
   // Duplicate name check — ignore the current template itself
   const duplicate = templates.find(function(other) {
@@ -1385,6 +1432,7 @@ function saveChecklist() {
   t.assignTo = assignType;
   t.assigned = [...selected];
   t.requirePhotos = switchIsOn('reqPhotos');
+  t.requireSignoff = switchIsOn('reqSignoff');
   t.tripType = tripType;
   renderSidebar();
 
@@ -1394,9 +1442,14 @@ function saveChecklist() {
     type: 'ChecklistTemplate',
     id: t.id, name: t.name, assignTo: t.assignTo,
     assigned: t.assigned, requirePhotos: t.requirePhotos,
+    requireSignoff: t.requireSignoff === true,
     tripType: t.tripType || 'na',
     items: t.items, updatedAt: new Date().toISOString()
   };
+  if (JSON.stringify(payload).length > 9500) {
+    toast('Checklist template is too large. Shorten item labels before saving.');
+    return;
+  }
 
   function onSaveErr(err) {
     const msg = err && (err.message || (typeof err === 'string' ? err : JSON.stringify(err)));
@@ -1921,6 +1974,7 @@ function saveConflictResolution(entityId, type) {
       type: 'ChecklistTemplate', id: t.id, name: t.name,
       assignTo: t.assignTo, assigned: t.assigned,
       requirePhotos: t.requirePhotos,
+      requireSignoff: t.requireSignoff === true,
       tripType: t.tripType || 'na',
       items: t.items,
       updatedAt: new Date().toISOString()
